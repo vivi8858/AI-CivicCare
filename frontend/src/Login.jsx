@@ -3,9 +3,11 @@ import { useState } from "react";
 import { supabase } from "./supabaseClient";
 import "./Login.css";
 
-export default function Login({ onLogin }) {
+export default function Login() {
   const [isSignup, setIsSignup] = useState(false);
   const [name, setName] = useState("");
+  const [accountType, setAccountType] = useState("citizen");
+  const [department, setDepartment] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -29,6 +31,11 @@ export default function Login({ onLogin }) {
       return;
     }
 
+    if (isSignup && accountType === "authority" && !department) {
+      setError("Please select your department.");
+      return;
+    }
+
     if (isSignup && password.length < 6) {
       setError("Password must be at least 6 characters.");
       return;
@@ -45,6 +52,8 @@ export default function Login({ onLogin }) {
             options: {
               data: {
                 full_name: name.trim(),
+                requested_role: accountType,
+                requested_department: accountType === "authority" ? department : null,
               },
             },
           });
@@ -60,23 +69,16 @@ export default function Login({ onLogin }) {
           return;
         }
 
-        // If email confirmation is disabled,
-        // Supabase may sign the user in immediately.
-        if (data.session && onLogin) {
-          onLogin(data.user);
-        }
+        // Session restore in App.jsx listens to onAuthStateChange.
+        // New accounts always start as citizens in the profiles table.
       } else {
-        const { data, error: loginError } =
+        const { error: loginError } =
           await supabase.auth.signInWithPassword({
             email: email.trim().toLowerCase(),
             password,
           });
 
         if (loginError) throw loginError;
-
-        if (onLogin) {
-          onLogin(data.user);
-        }
       }
     } catch (err) {
       setError(err.message || "Authentication failed.");
@@ -136,7 +138,7 @@ export default function Login({ onLogin }) {
 
             <p>
               {isSignup
-                ? "Create your citizen account to get started."
+                ? "Choose Citizen or Authority to create your account."
                 : "Sign in to continue making a difference."}
             </p>
           </div>
@@ -157,6 +159,43 @@ export default function Login({ onLogin }) {
                   autoComplete="name"
                   required
                 />
+              </div>
+            )}
+
+            {isSignup && (
+              <div className="login-field">
+                <label htmlFor="account-type">Register as</label>
+                <select
+                  id="account-type"
+                  value={accountType}
+                  onChange={(e) => setAccountType(e.target.value)}
+                  style={{ width: "100%", padding: "12px", borderRadius: "12px" }}
+                >
+                  <option value="citizen">Citizen</option>
+                  <option value="authority">Authority</option>
+                </select>
+                {accountType === "authority" && (
+                  <>
+                    <label htmlFor="department">Department</label>
+                    <select
+                      id="department"
+                      value={department}
+                      onChange={(e) => setDepartment(e.target.value)}
+                      style={{ width: "100%", padding: "12px", borderRadius: "12px" }}
+                      required
+                    >
+                      <option value="">Select department</option>
+                      <option value="Sanitation">Sanitation</option>
+                      <option value="Roads">Roads</option>
+                      <option value="Water Supply">Water Supply</option>
+                      <option value="Electricity">Electricity</option>
+                      <option value="Drainage">Drainage</option>
+                    </select>
+                    <p style={{ fontSize: "12px", marginTop: "8px" }}>
+                      Authority access requires administrator approval.
+                    </p>
+                  </>
+                )}
               </div>
             )}
 

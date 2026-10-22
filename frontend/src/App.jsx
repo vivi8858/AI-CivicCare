@@ -1,383 +1,195 @@
+import { predictComplaint } from "./aiApi";
 
-import { useRef, useState } from "react";
+import HotspotMap from "./HotspotMap";
+import { useEffect, useRef, useState } from "react";
 import Login from "./Login";
+import { supabase } from "./supabaseClient";
+import {
+  assessIssue,
+  authorityScopedComplaints,
+  authorityStatusOptions,
+  categoryOptions,
+  delay,
+  displayName,
+  fallbackDescription,
+  isAuthorityRole,
+  validateImageFile,
+  validateEvidenceFile,
+} from "./civicLogic";
+import {
+  confirmExistingIssue,
+  fetchComplaintsForUser,
+  fetchCommunityComplaints,
+  fetchHotspots,
+  fetchProfile,
+  fetchSimilarComplaints,
+  processComplaint,
+  registerEvidence,
+  reviewResolution,
+  submitComplaintRecord,
+  uploadEvidenceFile,
+} from "./complaintApi";
 import "./App.css";
 
-const starterComplaints = [
-  {
-    id: "CC-1001",
-    category: "Pothole",
-    description: "Large pothole outside the main market.",
-    location: "New Delhi",
-    coordinates: null,
-    severity: "High",
-    priority: 88,
-    department: "Roads & Public Works",
-    status: "In Progress",
-    sla: "48 hours",
-    reports: 6,
-    date: "Today",
-    duplicate: false,
-    beforeImage: null,
-    afterImage: null,
-  },
-  {
-    id: "CC-1000",
-    category: "Garbage",
-    description: "Overflowing garbage bin near the park.",
-    location: "New Delhi",
-    coordinates: null,
-    severity: "Medium",
-    priority: 65,
-    department: "Sanitation Department",
-    status: "Resolved",
-    sla: "4 days",
-    reports: 3,
-    date: "Yesterday",
-    duplicate: false,
-    beforeImage: null,
-    afterImage: null,
-  },
-];
-
-const categoryOptions = [
-  { value: "Pothole", label: "Road / Pothole" },
-  { value: "Garbage", label: "Garbage / Waste" },
-  { value: "Water Leak", label: "Water Leak" },
-  { value: "Street Light", label: "Street Light" },
-  { value: "Drainage", label: "Drainage / Flooding" },
-  { value: "Fallen Tree", label: "Fallen Tree" },
-  { value: "Other", label: "Something Else" },
-];
-
-const departmentRoutes = {
-  Pothole: "Roads & Public Works",
-  Garbage: "Sanitation Department",
-  "Water Leak": "Water & Utilities",
-  "Street Light": "Electrical Department",
-  Drainage: "Drainage & Municipal Works",
-  "Fallen Tree": "Horticulture Department",
-  Other: "Municipal Helpdesk",
-};
-
-const delay = (ms) =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-// Ignore common words when comparing descriptions.
-const commonWords = new Set([
-  "the", "and", "near", "outside", "inside",
-  "road", "issue", "there", "with", "from",
-  "this", "that", "have", "has", "large",
-  "small", "very", "problem", "area", "street",
-  "around", "a", "an", "at", "of", "to",
-  "in", "is", "on",
-]);
-
-function words(text) {
-  return new Set(
-    (text || "")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, " ")
-      .split(/\s+/)
-      .filter(
-        (word) =>
-          word.length > 2 && !commonWords.has(word)
-      )
-  );
-}
-
-// Compare the important words in two pieces of text.
-function similarity(a, b) {
-  const left = words(a);
-  const right = words(b);
-
-  if (!left.size || !right.size) return 0;
-
-  let shared = 0;
-
-  for (const word of left) {
-    if (right.has(word)) shared++;
-  }
-
-  return shared / Math.min(left.size, right.size);
-}
-
-// Calculate approximate distance between two GPS points.
-function gpsDistanceMeters(a, b) {
-  if (!a || !b) return Infinity;
-
-  const toRad = (value) => (value * Math.PI) / 180;
-
-  const dLat = toRad(b.latitude - a.latitude);
-  const dLon = toRad(b.longitude - a.longitude);
-
-  const h =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(a.latitude)) *
-      Math.cos(toRad(b.latitude)) *
-      Math.sin(dLon / 2) ** 2;
-
-  return (
-    6371000 *
-    2 *
-    Math.atan2(Math.sqrt(h), Math.sqrt(1 - h))
-  );
-}
-
-// Find a possible duplicate among active complaints.
-function findPossibleDuplicate(
-  category,
-  description,
-  location,
-  coordinates,
-  complaints
-) {
-  return (
-    complaints.find((item) => {
-      if (
-        item.category !== category ||
-        ["Resolved", "Verified"].includes(item.status)
-      ) {
-        return false;
-      }
-
-      const distance = gpsDistanceMeters(
-        coordinates,
-        item.coordinates
-      );
-
-      const sameLocation =
-        location.trim().toLowerCase() ===
-        (item.location || "").trim().toLowerCase();
-
-      const locationSimilarity = similarity(
-        location,
-        item.location
-      );
-
-      const descriptionSimilarity = similarity(
-        description,
-        item.description
-      );
-
-      const close =
-        distance <= 150 ||
-        sameLocation ||
-        locationSimilarity >= 0.65;
-
-      return (
-        close &&
-        (descriptionSimilarity >= 0.35 || distance <= 30)
-      );
-    }) || null
-  );
-}
-
-// Demo rule-based assessment, not a trained AI model.
-function assessIssue(
-  category,
-  description,
-  complaints,
-  location,
-  coordinates
-) {
-  const text = `${category} ${description}`.toLowerCase();
-
-  const hasAny = (keywords) =>
-    keywords.some((word) => text.includes(word));
-
-  let severity = "Medium";
-
-  if (
-    hasAny([
-      "fire",
-      "electric shock",
-      "live wire",
-      "collapsed",
-      "life threatening",
-      "emergency",
-    ])
-  ) {
-    severity = "Critical";
-  } else if (
-    hasAny([
-      "dangerous",
-      "accident",
-      "injury",
-      "school",
-      "hospital",
-      "flood",
-      "major",
-      "huge",
-      "blocked",
-      "busy road",
-    ])
-  ) {
-    severity = "High";
-  } else if (
-    hasAny(["small", "minor", "slightly", "tiny"])
-  ) {
-    severity = "Low";
-  }
-
-  const base = {
-    Critical: 90,
-    High: 75,
-    Medium: 60,
-    Low: 48,
-  }[severity];
-
-  const impact = hasAny([
-    "school",
-    "hospital",
-    "busy road",
-    "traffic",
-    "many people",
-    "accident",
-    "dangerous",
-    "emergency",
-  ])
-    ? 10
-    : 0;
-
-  const priority = Math.min(base + impact, 100);
-
-  const sla = {
-    Critical: "24 hours",
-    High: "48 hours",
-    Medium: "4 days",
-    Low: "7 days",
-  }[severity];
-
-  const possibleMatch = findPossibleDuplicate(
-    category,
-    description,
-    location,
-    coordinates,
-    complaints
-  );
-
-  const duplicate = possibleMatch
-    ? {
-        id: possibleMatch.id,
-        reports: possibleMatch.reports,
-        location: possibleMatch.location,
-        description: possibleMatch.description,
-      }
-    : null;
-
-  return {
-    severity,
-    priority,
-    department:
-      departmentRoutes[category] || departmentRoutes.Other,
-    sla,
-    duplicate,
-  };
-}
-
-function readComplaints() {
-  try {
-    const saved = localStorage.getItem(
-      "civiccare_complaints"
-    );
-
-    const parsed = saved ? JSON.parse(saved) : null;
-
-    return Array.isArray(parsed)
-      ? parsed
-      : starterComplaints;
-  } catch {
-    return starterComplaints;
-  }
-}
-
 function App() {
+  const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
   const [user, setUser] = useState(null);
+
   const [activePage, setActivePage] = useState("report");
-  const [complaints, setComplaints] =
-    useState(readComplaints);
+  const [complaints, setComplaints] = useState([]);
+  const [listLoading, setListLoading] = useState(false);
+  const [listError, setListError] = useState("");
 
   const [category, setCategory] = useState("");
   const [description, setDescription] = useState("");
+
+  const [aiSuggestion, setAiSuggestion] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState("");
+
   const [location, setLocation] = useState("");
   const [coordinates, setCoordinates] = useState(null);
 
   const [image, setImage] = useState(null);
+  const [imageFile, setImageFile] = useState(null);
   const [imageName, setImageName] = useState("");
 
-  const [locationLoading, setLocationLoading] =
-    useState(false);
-
-  const [analysisRunning, setAnalysisRunning] =
-    useState(false);
-
+  const [locationLoading, setLocationLoading] = useState(false);
+  const [analysisRunning, setAnalysisRunning] = useState(false);
   const [analysisStage, setAnalysisStage] = useState("");
   const [analysis, setAnalysis] = useState(null);
   const [message, setMessage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
-  const [selectedComplaint, setSelectedComplaint] =
-    useState(null);
-
+  const [selectedComplaint, setSelectedComplaint] = useState(null);
   const [pendingReport, setPendingReport] = useState(null);
+  const [similarComplaints, setSimilarComplaints] = useState([]);
+
+  const [hotspots, setHotspots] = useState([]);
+  const [hotspotError, setHotspotError] = useState("");
+  const [authorityNote, setAuthorityNote] = useState("");
+  const [authorityStatus, setAuthorityStatus] = useState("Assigned");
+  const [verifyNote, setVerifyNote] = useState("");
 
   const fileInputRef = useRef(null);
   const afterImageRef = useRef(null);
+  const submitLock = useRef(false);
 
-  function saveComplaints(updated) {
-    setComplaints(updated);
+  const isAuthority = isAuthorityRole(profile);
+
+  async function loadWorkspace(authUser) {
+    if (!authUser) {
+      setComplaints([]);
+      setProfile(null);
+      setSimilarComplaints([]);
+      setHotspots([]);
+      setSelectedComplaint(null);
+      return;
+    }
+
+    setListLoading(true);
+    setListError("");
 
     try {
-      // Browser blob URLs cannot persist as real uploads.
-      localStorage.setItem(
-        "civiccare_complaints",
-        JSON.stringify(
-          updated.map((complaint) => ({
-            ...complaint,
-            beforeImage: null,
-            afterImage: null,
-          }))
-        )
+      const nextProfile = await fetchProfile(authUser.id);
+      setProfile(nextProfile);
+
+      const visible = isAuthorityRole(nextProfile)
+        ? await fetchComplaintsForUser(authUser)
+        : await fetchCommunityComplaints(authUser);
+
+      setComplaints(visible);
+      setSelectedComplaint((current) =>
+        current
+          ? visible.find((item) => item.id === current.id) || null
+          : null
       );
-    } catch {
-      setMessage(
-        "Storage is full or unavailable. Reports may not persist."
-      );
+    } catch (error) {
+      setListError(error.message || "Could not load complaints.");
+      setComplaints([]);
+    } finally {
+      setListLoading(false);
     }
   }
+
+  useEffect(() => {
+    let cancelled = false;
+
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (cancelled) return;
+      if (error) {
+        setAuthReady(true);
+        return;
+      }
+      setSession(data.session);
+      setUser(data.session?.user || null);
+      setAuthReady(true);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_event, nextSession) => {
+        setSession(nextSession);
+        setUser(nextSession?.user || null);
+        if (!nextSession) {
+          setProfile(null);
+          setComplaints([]);
+          setSelectedComplaint(null);
+          setActivePage("report");
+          setMessage("");
+        }
+      }
+    );
+
+    return () => {
+      cancelled = true;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authReady) return;
+    loadWorkspace(user);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authReady, user?.id]);
+
+  useEffect(() => {
+    if (activePage !== "hotspots" || !user) return;
+
+    fetchHotspots()
+      .then(setHotspots)
+      .catch((error) =>
+        setHotspotError(error.message || "Hotspots are not available yet.")
+      );
+  }, [activePage, user]);
 
   function handleImageChange(event) {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    if (!file.type.startsWith("image/")) {
-      setMessage("Please select an image file.");
-      return;
-    }
-
-    if (file.size > 5 * 1024 * 1024) {
-      setMessage("Please select an image smaller than 5 MB.");
+    const invalid = validateEvidenceFile(file);
+    if (invalid) {
+      setMessage(invalid);
       return;
     }
 
     if (image) URL.revokeObjectURL(image);
 
+    setImageFile(file);
     setImage(URL.createObjectURL(file));
     setImageName(file.name);
     setAnalysis(null);
     setPendingReport(null);
-    setMessage("");
+    setMessage("Evidence added. You can now fill in the details.");
   }
 
   function removeImage() {
     if (image) URL.revokeObjectURL(image);
-
     setImage(null);
+    setImageFile(null);
     setImageName("");
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
+    if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
   async function reverseGeocode(latitude, longitude) {
@@ -385,29 +197,20 @@ function App() {
       const response = await fetch(
         `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}`
       );
-
-      if (!response.ok) {
-        throw new Error("Address lookup failed");
-      }
-
+      if (!response.ok) throw new Error("Address lookup failed");
       const data = await response.json();
-
       setLocation(
         data.display_name ||
           `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`
       );
     } catch {
-      setLocation(
-        `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`
-      );
+      setLocation(`${latitude.toFixed(6)}, ${longitude.toFixed(6)}`);
     }
   }
 
   function getLocation() {
     if (!navigator.geolocation) {
-      setMessage(
-        "Location detection is not supported on this device."
-      );
+      setMessage("Location detection is not supported on this device.");
       return;
     }
 
@@ -420,48 +223,28 @@ function App() {
           latitude: coords.latitude,
           longitude: coords.longitude,
         };
-
         setCoordinates(nextCoordinates);
-
-        await reverseGeocode(
-          coords.latitude,
-          coords.longitude
-        );
-
+        await reverseGeocode(coords.latitude, coords.longitude);
         setLocationLoading(false);
         setAnalysis(null);
         setPendingReport(null);
-
-        setMessage(
-          "Location detected. Please check the address."
-        );
+        setMessage("Location detected. Please check the address.");
       },
       (error) => {
         setLocationLoading(false);
-
         setMessage(
           error.code === 1
             ? "Location permission denied. Enter it manually."
             : "Could not detect location. Enter it manually."
         );
       },
-      {
-        enableHighAccuracy: true,
-        timeout: 10000,
-        maximumAge: 0,
-      }
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
   }
 
   async function runAnalysis() {
-    if (
-      !category ||
-      !description.trim() ||
-      !location.trim()
-    ) {
-      setMessage(
-        "Please enter the issue type, description and location."
-      );
+    if (!category || !location.trim()) {
+      setMessage("Please select an issue type and provide a location.");
       return null;
     }
 
@@ -480,10 +263,23 @@ function App() {
       await delay(350);
     }
 
+    let nearby = similarComplaints;
+    try {
+      nearby = await fetchSimilarComplaints({
+        category,
+        latitude: coordinates?.latitude,
+        longitude: coordinates?.longitude,
+        location,
+      });
+      setSimilarComplaints(nearby);
+    } catch {
+      nearby = complaints;
+    }
+
     const result = assessIssue(
       category,
       description,
-      complaints,
+      nearby.length ? nearby : complaints,
       location,
       coordinates
     );
@@ -491,181 +287,220 @@ function App() {
     setAnalysis(result);
     setAnalysisRunning(false);
     setAnalysisStage("");
-
     return result;
+  }
+
+
+  async function handleSuggestCategory() {
+    if (!description.trim() || aiLoading) return;
+
+    setAiLoading(true);
+    setAiError("");
+    setAiSuggestion(null);
+
+    try {
+      const result = await predictComplaint(description);
+      setAiSuggestion(result);
+    } catch (error) {
+      setAiError(error.message || "Could not get a suggestion.");
+    } finally {
+      setAiLoading(false);
+    }
   }
 
   function resetReport() {
     setCategory("");
     setDescription("");
+    setAiSuggestion(null);
+    setAiError("");
     setLocation("");
     setCoordinates(null);
-
     removeImage();
-
     setAnalysis(null);
     setPendingReport(null);
     setMessage("");
   }
 
-  function createNewComplaint(result) {
-    const complaint = {
-      id: `CC-${Date.now()}`,
-      category,
-      description: description.trim(),
-      location: location.trim(),
-      coordinates,
-      severity: result.severity,
-      priority: result.priority,
-      department: result.department,
-      status: "Submitted",
-      sla: result.sla,
-      reports: 1,
-      date: new Date().toLocaleDateString(),
-      duplicate: false,
-      beforeImage: image,
-      afterImage: null,
-    };
+  async function persistNewComplaint() {
+    if (submitLock.current || submitting) return;
+    submitLock.current = true;
+    setSubmitting(true);
 
-    saveComplaints([complaint, ...complaints]);
-    resetReport();
+    try {
+      let uploadWarning = "";
+      const savedId = await submitComplaintRecord({
+        category,
+        description,
+        location,
+        coordinates,
+      });
 
-    setActivePage("complaints");
-    setSelectedComplaint(complaint);
+      if (imageFile && savedId) {
+        try {
+          const path = await uploadEvidenceFile(user.id, savedId, imageFile);
+          await registerEvidence(savedId, "original", path);
+        } catch (photoError) {
+          uploadWarning = " Complaint saved, but evidence upload failed: " +
+              (photoError.message || "storage is not configured.");
+        }
+      }
+
+      await loadWorkspace(user);
+      resetReport();
+      setActivePage("complaints");
+      setMessage("Complaint saved to your CivicCare account." + uploadWarning);
+    } catch (error) {
+      setMessage(error.message || "Could not save the complaint.");
+    } finally {
+      submitLock.current = false;
+      setSubmitting(false);
+    }
   }
 
   async function submitComplaint(event) {
     event.preventDefault();
-
-    if (analysisRunning) return;
+    if (analysisRunning || submitting) return;
 
     const result = await runAnalysis();
     if (!result) return;
 
     if (result.duplicate) {
-      // Ask before merging.
       setPendingReport(result);
       return;
     }
 
-    createNewComplaint(result);
+    await persistNewComplaint();
   }
 
-  // Merge the new report into an existing complaint.
-  function mergeWithExisting() {
-    if (!pendingReport?.duplicate) return;
+  async function mergeWithExisting() {
+    if (!pendingReport?.duplicate || submitLock.current) return;
+    submitLock.current = true;
+    setSubmitting(true);
 
-    const id = pendingReport.duplicate.id;
-
-    const existing = complaints.find(
-      (complaint) => complaint.id === id
-    );
-
-    if (
-      !existing ||
-      ["Resolved", "Verified"].includes(existing.status)
-    ) {
-      setPendingReport(null);
-      setMessage(
-        "That complaint is no longer active. Please submit again."
-      );
-      return;
+    try {
+      await confirmExistingIssue(pendingReport.duplicate.id);
+      await loadWorkspace(user);
+      resetReport();
+      setActivePage("complaints");
+      setMessage("Your report was added to the existing complaint.");
+    } catch (error) {
+      setMessage(error.message || "Could not confirm that issue.");
+    } finally {
+      submitLock.current = false;
+      setSubmitting(false);
     }
-
-    const updated = complaints.map((complaint) =>
-      complaint.id === id
-        ? {
-            ...complaint,
-            reports: complaint.reports + 1,
-            priority: Math.min(
-              100,
-              complaint.priority + 3
-            ),
-          }
-        : complaint
-    );
-
-    saveComplaints(updated);
-    resetReport();
-
-    setActivePage("complaints");
-
-    setSelectedComplaint(
-      updated.find((complaint) => complaint.id === id)
-    );
   }
 
-  function confirmSameIssue(id) {
-    const updated = complaints.map((complaint) =>
-      complaint.id === id
-        ? {
-            ...complaint,
-            reports: complaint.reports + 1,
-            priority: Math.min(
-              100,
-              complaint.priority + 3
-            ),
-          }
-        : complaint
-    );
-
-    saveComplaints(updated);
-
-    setSelectedComplaint(
-      updated.find((complaint) => complaint.id === id) ||
-        null
-    );
+  async function confirmSameIssue(id) {
+    if (submitLock.current) return;
+    submitLock.current = true;
+    try {
+      await confirmExistingIssue(id);
+      await loadWorkspace(user);
+      setMessage("Thanks — this issue is now linked to your account.");
+    } catch (error) {
+      setMessage(error.message || "Could not confirm this issue.");
+    } finally {
+      submitLock.current = false;
+    }
   }
 
-  function handleAfterImage(event) {
+  async function handleAfterImage(event) {
     const file = event.target.files?.[0];
-
     if (!file || !selectedComplaint) return;
 
-    if (
-      !file.type.startsWith("image/") ||
-      file.size > 5 * 1024 * 1024
-    ) {
+    const invalid = validateImageFile(file);
+    if (invalid) {
+      setMessage(invalid);
       return;
     }
 
-    const afterImage = URL.createObjectURL(file);
-
-    const updated = complaints.map((complaint) =>
-      complaint.id === selectedComplaint.id
-        ? { ...complaint, afterImage }
-        : complaint
-    );
-
-    saveComplaints(updated);
-
-    setSelectedComplaint((previous) => ({
-      ...previous,
-      afterImage,
-    }));
+    try {
+      const path = await uploadEvidenceFile(user.id, selectedComplaint.id, file);
+      await registerEvidence(selectedComplaint.id, "resolution", path);
+      await loadWorkspace(user);
+      setMessage("Resolution photo saved.");
+    } catch (error) {
+      setMessage(error.message || "Could not upload the resolution photo.");
+    }
   }
 
-  const totalReports = complaints.length;
+  async function handleProcessComplaint() {
+    if (!selectedComplaint) return;
+    try {
+      await processComplaint(
+        selectedComplaint.id,
+        authorityStatus,
+        authorityNote
+      );
+      await loadWorkspace(user);
+      setMessage("Status updated.");
+    } catch (error) {
+      setMessage(error.message || "Status update was not allowed.");
+    }
+  }
 
-  const activeReports = complaints.filter(
+  async function handleReview(approved) {
+    if (!selectedComplaint) return;
+    try {
+      await reviewResolution(selectedComplaint.id, approved, verifyNote);
+      await loadWorkspace(user);
+      setMessage(
+        approved
+          ? "Resolution verified."
+          : "Resolution sent back as still in progress."
+      );
+    } catch (error) {
+      setMessage(error.message || "Verification was not allowed.");
+    }
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setSelectedComplaint(null);
+    setUser(null);
+    setSession(null);
+    setProfile(null);
+    setComplaints([]);
+    setMessage("");
+  }
+
+  const visibleComplaints = isAuthority
+    ? authorityScopedComplaints(complaints, profile)
+    : complaints;
+
+
+  const myComplaints = complaints.filter(c => c.createdBy === user?.id || c.confirmedByMe);
+
+  const statsSource = isAuthority ? visibleComplaints : complaints;
+  const totalReports = statsSource.length;
+  const activeReports = statsSource.filter(
     (complaint) =>
-      complaint.status !== "Resolved" &&
-      complaint.status !== "Verified"
+      complaint.status !== "Resolved" && complaint.status !== "Verified"
   ).length;
-
-  const resolvedReports = complaints.filter(
+  const resolvedReports = statsSource.filter(
     (complaint) =>
-      complaint.status === "Resolved" ||
-      complaint.status === "Verified"
+      complaint.status === "Resolved" || complaint.status === "Verified"
   ).length;
-
-  const highPriorityReports = complaints.filter(
+  const highPriorityReports = statsSource.filter(
     (complaint) => complaint.priority >= 80
   ).length;
 
-  if (!user) {
-    return <Login onLogin={setUser} />;
+  if (!authReady) {
+    return (
+      <div className="session-restore">
+        Restoring your CivicCare session...
+      </div>
+    );
   }
+
+  if (!session || !user) {
+    return <Login />;
+  }
+
+  const welcomeName = displayName(user, profile);
+  const reportStep = image ? (category && location ? 3 : 2) : 1;
+  const isVideoEvidence = Boolean(imageFile?.type?.startsWith("video/"));
 
   return (
     <div className="app">
@@ -676,27 +511,18 @@ function App() {
           onClick={() => setActivePage("report")}
         >
           <div className="brand-mark">✳</div>
-
           <div>
-            <div className="brand-name">
-              AI CivicCare
-            </div>
-
+            <div className="brand-name">AI CivicCare</div>
             <div className="brand-tagline">
               A little care makes a better city
             </div>
           </div>
         </button>
 
-        <nav
-          className="navigation"
-          aria-label="Main navigation"
-        >
+        <nav className="navigation" aria-label="Main navigation">
           <button
             type="button"
-            className={`nav-button ${
-              activePage === "report" ? "active" : ""
-            }`}
+            className={`nav-button ${activePage === "report" ? "active" : ""}`}
             onClick={() => setActivePage("report")}
           >
             Report Issue
@@ -709,124 +535,107 @@ function App() {
             }`}
             onClick={() => setActivePage("complaints")}
           >
-            My Complaints
-            <span className="nav-count">
-              {complaints.length}
-            </span>
+            Total Complaints
+            <span className="nav-count">{myComplaints.length}</span>
+          </button>
+
+          {isAuthority && (
+            <button
+              type="button"
+              className={`nav-button ${
+                activePage === "authority" ? "active" : ""
+              }`}
+              onClick={() => setActivePage("authority")}
+            >
+              Authority
+              <span className="nav-count">{visibleComplaints.length}</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            className={`nav-button ${
+              activePage === "hotspots" ? "active" : ""
+            }`}
+            onClick={() => setActivePage("hotspots")}
+          >
+            Hotspots
           </button>
         </nav>
 
-        <div className="system-status">
-          <span className="live-dot" />
-          Demo assessment
+        <div className="account-actions">
+          <div className="system-status">
+            <span className="live-dot" />
+            Demo assessment
+          </div>
+          <span className="user-name">{welcomeName}</span>
+          <button type="button" className="logout-button" onClick={handleLogout}>
+            Log out
+          </button>
         </div>
-
-        <button
-          type="button"
-          className="logout-button"
-          onClick={() => {
-            setSelectedComplaint(null);
-            setUser(null);
-          }}
-        >
-          Log out
-        </button>
       </header>
 
       <main className="main-content">
+        {message && activePage !== "report" && (
+          <div className="message" role="status">
+            {message}
+          </div>
+        )}
+
         {activePage === "report" ? (
           <section className="report-page">
             <div className="hero">
               <div>
                 <div className="eyebrow">
-                  WELCOME,{" "}
-                  {user.name?.toUpperCase() || "NEIGHBOUR"}
+                  WELCOME, {welcomeName.toUpperCase()}
                 </div>
-
                 <h1>
                   Little actions.
                   <br />
                   <span>Lovelier cities.</span>
                 </h1>
-
                 <p>
-                  Spot a problem in your neighbourhood?
-                  Share the details and location.
-                  CivicCare will estimate its urgency
-                  and suggest the responsible department.
+                  Start with a photo if you have one, then add the details
+                  and location. CivicCare will estimate urgency with demo
+                  rules and suggest the responsible department.
                 </p>
               </div>
 
               <div className="hero-ai-card">
-                <span className="hero-ai-icon">
-                  ✳
-                </span>
-
+                <span className="hero-ai-icon">✳</span>
                 <div>
-                  <strong>
-                    Thoughtful civic reporting
-                  </strong>
-
-                  <small>
-                    Report → Assess → Track → Verify
-                  </small>
+                  <strong>Photo-first civic reporting</strong>
+                  <small>Photo → Details → Assess → Track</small>
                 </div>
               </div>
             </div>
 
             <div className="stats-row">
-              <Stat
-                title="Total reports"
-                value={totalReports}
-              />
-
-              <Stat
-                title="High priority"
-                value={highPriorityReports}
-              />
-
-              <Stat
-                title="Active issues"
-                value={activeReports}
-              />
-
-              <Stat
-                title="Resolved"
-                value={resolvedReports}
-              />
+              <Stat title="Total reports" value={totalReports} />
+              <Stat title="High priority" value={highPriorityReports} />
+              <Stat title="Active issues" value={activeReports} />
+              <Stat title="Resolved" value={resolvedReports} />
             </div>
 
-            <form
-              className="report-card"
-              onSubmit={submitComplaint}
-            >
+            <form className="report-card" onSubmit={submitComplaint}>
               <div className="card-header">
                 <div>
                   <h2>Report a civic issue</h2>
-
-                  <p>
-                    Tell us what needs attention
-                    in your community.
-                  </p>
+                  <p>Tell us what needs attention in your community.</p>
                 </div>
-
-                <span className="secure-label">
-                  Local demo
-                </span>
+                <span className="secure-label">Signed in</span>
               </div>
 
               <div className="report-steps">
-                <div className="step-pill active">
+                <div className={`step-pill ${reportStep >= 1 ? "active" : ""}`}>
                   <span>1</span>
-                  Evidence
+                  Photo
                 </div>
-
-                <div className="step-pill">
+                <div className={`step-pill ${reportStep >= 2 ? "active" : ""}`}>
                   <span>2</span>
                   Details
                 </div>
-
-                <div className="step-pill">
+                <div className={`step-pill ${reportStep >= 3 ? "active" : ""}`}>
                   <span>3</span>
                   Review
                 </div>
@@ -834,87 +643,56 @@ function App() {
 
               <div className="form-grid">
                 <div className="form-section">
-                  <label>
-                    Photo evidence (optional)
-                  </label>
-
-                  <div
-                    className={`upload-box ${
-                      image ? "has-image" : ""
-                    }`}
-                  >
+                  <label>Photo or video evidence (recommended first step)</label>
+                  <div className={`upload-box ${image ? "has-image" : ""}`}>
                     {image ? (
                       <>
-                        <img
-                          className="preview-image"
-                          src={image}
-                          alt="Complaint photo preview"
-                        />
-
+                        {isVideoEvidence ? (
+                          <video className="preview-image" src={image} controls playsInline />
+                        ) : (
+                          <img className="preview-image" src={image} alt="Complaint photo preview" />
+                        )}
                         <div className="preview-actions">
                           <button
                             type="button"
-                            onClick={() =>
-                              fileInputRef.current?.click()
-                            }
+                            onClick={() => fileInputRef.current?.click()}
                           >
                             Replace
                           </button>
-
-                          <button
-                            type="button"
-                            onClick={removeImage}
-                          >
+                          <button type="button" onClick={removeImage}>
                             Remove
                           </button>
                         </div>
-
                         <small>{imageName}</small>
                       </>
                     ) : (
                       <>
-                        <span className="upload-symbol">
-                          ↑
-                        </span>
-
-                        <strong>Add a photo</strong>
-
-                        <p>
-                          Show us what needs attention
-                        </p>
-
+                        <span className="upload-symbol">↑</span>
+                        <strong>Start with a photo or video</strong>
+                        <p>Show us what needs attention</p>
                         <button
                           type="button"
                           className="gps-button"
-                          onClick={() =>
-                            fileInputRef.current?.click()
-                          }
+                          onClick={() => fileInputRef.current?.click()}
                         >
-                          Choose image
+                          Choose photo or video
                         </button>
-
-                        <small>
-                          Image up to 5 MB
-                        </small>
+                        <small>Images up to 5 MB · videos up to 25 MB</small>
                       </>
                     )}
                   </div>
-
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept="image/*"
+                    accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime"
                     hidden
                     onChange={handleImageChange}
-                    aria-label="Choose complaint photo"
+                    aria-label="Choose complaint photo or video"
                   />
                 </div>
 
                 <div className="form-section">
-                  <label htmlFor="category">
-                    What is the problem?
-                  </label>
-
+                  <label htmlFor="category">What is the problem?</label>
                   <select
                     id="category"
                     value={category}
@@ -925,41 +703,56 @@ function App() {
                       setPendingReport(null);
                     }}
                   >
-                    <option value="">
-                      Choose an issue
-                    </option>
-
+                    <option value="">Choose an issue</option>
                     {categoryOptions.map((item) => (
-                      <option
-                        key={item.value}
-                        value={item.value}
-                      >
+                      <option key={item.value} value={item.value}>
                         {item.label}
                       </option>
                     ))}
                   </select>
 
                   <label htmlFor="description">
-                    Tell us what you noticed
+                    Tell us what you noticed (optional)
                   </label>
-
                   <textarea
                     id="description"
                     rows={5}
-                    required
                     value={description}
                     placeholder="For example: A pothole outside the school is causing traffic problems."
                     onChange={(event) => {
                       setDescription(event.target.value);
+                      setAiSuggestion(null);
+                      setAiError("");
                       setAnalysis(null);
                       setPendingReport(null);
                     }}
                   />
 
-                  <label htmlFor="location">
-                    Where is the problem?
-                  </label>
+                  <div className="ai-suggestion-panel">
+                    <button
+                      type="button"
+                      className="gps-button"
+                      onClick={handleSuggestCategory}
+                      disabled={!description.trim() || aiLoading}
+                    >
+                      {aiLoading ? "Analysing..." : "✳ Suggest Category"}
+                    </button>
 
+                    {aiSuggestion && (
+                      <p className="ai-suggestion-result" role="status">
+                        Suggested category: <strong>{aiSuggestion.category}</strong>
+                        <span> (Rule-based demo)</span>
+                      </p>
+                    )}
+
+                    {aiError && (
+                      <p className="ai-suggestion-error" role="alert">
+                        {aiError}
+                      </p>
+                    )}
+                  </div>
+
+                  <label htmlFor="location">Where is the problem?</label>
                   <div className="location-area">
                     <input
                       id="location"
@@ -973,7 +766,6 @@ function App() {
                         setPendingReport(null);
                       }}
                     />
-
                     <button
                       type="button"
                       className="gps-button"
@@ -985,12 +777,9 @@ function App() {
                         : "⌖ Detect my location"}
                     </button>
                   </div>
-
                   {coordinates && (
                     <small className="coordinates">
-                      GPS:{" "}
-                      {coordinates.latitude.toFixed(5)},
-                      {" "}
+                      GPS: {coordinates.latitude.toFixed(5)},{" "}
                       {coordinates.longitude.toFixed(5)}
                     </small>
                   )}
@@ -998,10 +787,7 @@ function App() {
               </div>
 
               {message && (
-                <div
-                  className="message"
-                  role="status"
-                >
+                <div className="message" role="status">
                   {message}
                 </div>
               )}
@@ -1009,16 +795,13 @@ function App() {
               {!analysis && !analysisRunning && (
                 <div className="analyse-row">
                   <div>
-                    <strong>
-                      Ready for a quick assessment?
-                    </strong>
-
+                    <strong>Ready for a quick assessment?</strong>
                     <p>
-                      We'll estimate severity, priority
-                      and department using demo rules.
+                      This is a rule-based demo, not a trained vision model.
+                      It estimates severity, priority and department from
+                      the text you enter.
                     </p>
                   </div>
-
                   <button
                     type="button"
                     className="analyse-button"
@@ -1030,25 +813,16 @@ function App() {
               )}
 
               {analysisRunning && (
-                <div
-                  className="ai-processing"
-                  role="status"
-                >
+                <div className="ai-processing" role="status">
                   <span className="processing-dot" />
-
                   <div>
-                    <strong>
-                      Assessing your report
-                    </strong>
-
+                    <strong>Assessing your report</strong>
                     <p>{analysisStage}</p>
                   </div>
                 </div>
               )}
 
-              {analysis && (
-                <AIAnalysis analysis={analysis} />
-              )}
+              {analysis && <AIAnalysis analysis={analysis} />}
 
               {pendingReport?.duplicate && (
                 <div
@@ -1059,38 +833,18 @@ function App() {
                   <div className="analysis-kicker">
                     POSSIBLE DUPLICATE — YOUR CHOICE
                   </div>
-
-                  <h3>
-                    Is this the same problem?
-                  </h3>
-
+                  <h3>Is this the same problem?</h3>
                   <p>
                     Existing complaint{" "}
-                    <strong>
-                      {pendingReport.duplicate.id}
-                    </strong>
-                    :{" "}
+                    <strong>{pendingReport.duplicate.id}</strong>:{" "}
                     {pendingReport.duplicate.description}
                   </p>
-
-                  <p>
-                    Location:{" "}
-                    {pendingReport.duplicate.location}
-                  </p>
-
+                  <p>Location: {pendingReport.duplicate.location}</p>
                   <p>
                     Already reported by{" "}
-                    <strong>
-                      {pendingReport.duplicate.reports}
-                    </strong>{" "}
+                    <strong>{pendingReport.duplicate.reports}</strong>{" "}
                     citizen(s).
                   </p>
-
-                  <p>
-                    Matching is only a suggestion.
-                    Please check before combining reports.
-                  </p>
-
                   <div
                     style={{
                       display: "flex",
@@ -1103,16 +857,15 @@ function App() {
                       type="button"
                       className="submit-button"
                       onClick={mergeWithExisting}
+                      disabled={submitting}
                     >
                       Yes, same issue — add my report
                     </button>
-
                     <button
                       type="button"
                       className="gps-button"
-                      onClick={() =>
-                        createNewComplaint(pendingReport)
-                      }
+                      onClick={persistNewComplaint}
+                      disabled={submitting}
                     >
                       No, different issue — create new
                     </button>
@@ -1122,82 +875,78 @@ function App() {
 
               <div className="form-footer">
                 <span>
-                  This is a student prototype;
-                  reports are stored only in this browser.
+                  Reports are saved to your signed-in CivicCare account.
+                  Empty descriptions are replaced with a generated summary.
                 </span>
-
                 <button
                   type="submit"
                   className="submit-button"
-                  disabled={
-                    analysisRunning ||
-                    Boolean(pendingReport)
-                  }
+                  disabled={analysisRunning || submitting || Boolean(pendingReport)}
                 >
-                  {pendingReport
+                  {submitting
+                    ? "Saving..."
+                    : pendingReport
                     ? "Choose an option above"
                     : "Submit complaint →"}
                 </button>
               </div>
             </form>
           </section>
+        ) : activePage === "complaints" ? (
+          <ComplaintListPage
+            title="Total complaints"
+            eyebrow="YOUR COMMUNITY ACTIVITY"
+            description="Explore community reports and confirm an issue affecting you."
+            complaints={complaints}
+            loading={listLoading}
+            error={listError}
+            emptyText="No community reports yet. Create the first report."
+            onNew={() => setActivePage("report")}
+            onOpen={setSelectedComplaint}
+          />
+        ) : activePage === "authority" && isAuthority ? (
+          <ComplaintListPage
+            title="Authority dashboard"
+            eyebrow="PERMITTED SCOPE"
+            description={
+              profile?.department
+                ? `Showing ${profile.department} complaints.`
+                : "Showing complaints across departments you are allowed to process."
+            }
+            complaints={visibleComplaints}
+            loading={listLoading}
+            error={listError}
+            emptyText="No complaints in your scope yet."
+            onNew={() => setActivePage("report")}
+            onOpen={(complaint) => {
+              setSelectedComplaint(complaint);
+              setAuthorityStatus(
+                complaint.status === "Verified"
+                  ? "Resolved"
+                  : complaint.status
+              );
+            }}
+          />
         ) : (
-          <section className="complaints-page">
-            <div className="page-heading">
-              <div>
-                <div className="eyebrow">
-                  YOUR COMMUNITY ACTIVITY
-                </div>
-
-                <h1>My complaints</h1>
-
-                <p>
-                  Follow your reports from
-                  submission to resolution.
-                </p>
-              </div>
-
-              <button
-                type="button"
-                className="submit-button"
-                onClick={() =>
-                  setActivePage("report")
-                }
-              >
-                + New report
-              </button>
-            </div>
-
-            <div className="complaints-list">
-              {complaints.length ? (
-                complaints.map((complaint) => (
-                  <ComplaintCard
-                    key={complaint.id}
-                    complaint={complaint}
-                    onOpen={() =>
-                      setSelectedComplaint(complaint)
-                    }
-                  />
-                ))
-              ) : (
-                <p>
-                  No reports yet. Create your first report.
-                </p>
-              )}
-            </div>
-          </section>
+          <HotspotPage points={hotspots} error={hotspotError} />
         )}
       </main>
 
       {selectedComplaint && (
         <ComplaintModal
           complaint={selectedComplaint}
-          onClose={() =>
-            setSelectedComplaint(null)
-          }
-          onSameIssue={() =>
-            confirmSameIssue(selectedComplaint.id)
-          }
+          isAuthority={isAuthority}
+          currentUserId={user.id}
+          authorityStatus={authorityStatus}
+          authorityNote={authorityNote}
+          verifyNote={verifyNote}
+          onAuthorityStatus={setAuthorityStatus}
+          onAuthorityNote={setAuthorityNote}
+          onVerifyNote={setVerifyNote}
+          onProcess={handleProcessComplaint}
+          onReview={handleReview}
+          onClose={() => setSelectedComplaint(null)}
+          onSameIssue={() => confirmSameIssue(selectedComplaint.id)}
           afterImageRef={afterImageRef}
           onAfterImage={handleAfterImage}
         />
@@ -1206,6 +955,115 @@ function App() {
   );
 }
 
+function ComplaintListPage({
+  title,
+  eyebrow,
+  description,
+  complaints,
+  loading,
+  error,
+  emptyText,
+  onNew,
+  onOpen,
+}) {
+  return (
+    <section className="complaints-page">
+      <div className="page-heading">
+        <div>
+          <div className="eyebrow">{eyebrow}</div>
+          <h1>{title}</h1>
+          <p>{description}</p>
+        </div>
+        <button type="button" className="submit-button" onClick={onNew}>
+          + New report
+        </button>
+      </div>
+
+      {loading && <p className="empty-copy">Loading complaints...</p>}
+      {error && (
+        <div className="message" role="alert">
+          {error}
+        </div>
+      )}
+
+      <div className="complaints-list">
+        {!loading && complaints.length ? (
+          complaints.map((complaint) => (
+            <ComplaintCard
+              key={complaint.id}
+              complaint={complaint}
+              onOpen={() => onOpen(complaint)}
+            />
+          ))
+        ) : !loading ? (
+          <div className="empty-state">
+            <strong>Nothing here yet</strong>
+            <p>{emptyText}</p>
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+
+function HotspotPage({ points, error }) {
+  const located = (points || []).filter((point) => {
+    const lat = Number(point.latitude);
+    const lng = Number(point.longitude);
+
+    return (
+      point.latitude != null &&
+      point.longitude != null &&
+      Number.isFinite(lat) &&
+      Number.isFinite(lng) &&
+      lat >= -90 &&
+      lat <= 90 &&
+      lng >= -180 &&
+      lng <= 180
+    );
+  });
+
+  return (
+    <section className="complaints-page">
+      <div className="page-heading">
+        <div>
+          <div className="eyebrow">CIVIC MAP</div>
+          <h1>Neighbourhood hotspots</h1>
+          <p>
+            Explore complaint locations and identify areas with
+            higher concentrations of reported civic issues.
+          </p>
+        </div>
+      </div>
+
+      {error && (
+        <div className="message" role="alert">
+          {error}
+        </div>
+      )}
+
+      <div className="stats-grid">
+        <Stat title="Mapped complaints" value={located.length} />
+        <Stat
+          title="Categories"
+          value={new Set(located.map((p) => p.category)).size}
+        />
+      </div>
+
+      <HotspotMap points={located} />
+
+      {!located.length && (
+        <p className="empty-copy">
+          No mapped complaints yet. Submit a complaint with GPS
+          enabled to see it on the map.
+        </p>
+      )}
+    </section>
+  );
+}
+
+          
 function Stat({ title, value }) {
   return (
     <div className="stat-card">
@@ -1223,10 +1081,8 @@ function AIAnalysis({ analysis }) {
           <span className="analysis-kicker">
             ✳ RULE-BASED DEMO ASSESSMENT
           </span>
-
           <h3>Assessment complete</h3>
         </div>
-
         <div className="priority-score">
           <strong>{analysis.priority}</strong>
           <span>/100</span>
@@ -1239,7 +1095,6 @@ function AIAnalysis({ analysis }) {
           value={analysis.severity}
           className={`severity-text ${analysis.severity.toLowerCase()}`}
         />
-
         <AnalysisItem
           title="Priority"
           value={
@@ -1250,12 +1105,10 @@ function AIAnalysis({ analysis }) {
               : "Normal"
           }
         />
-
         <AnalysisItem
           title="Suggested department"
           value={analysis.department}
         />
-
         <AnalysisItem
           title="Illustrative resolution target"
           value={analysis.sla}
@@ -1264,63 +1117,41 @@ function AIAnalysis({ analysis }) {
 
       {analysis.duplicate ? (
         <div className="duplicate-warning">
-          <strong>
-            Possible similar report
-          </strong>
-
+          <strong>Possible similar report</strong>
           <p>
-            {analysis.duplicate.id} may describe
-            a similar issue.{" "}
-            {analysis.duplicate.reports} report(s)
-            already exist.
+            {analysis.duplicate.id} may describe a similar issue.{" "}
+            {analysis.duplicate.reports} report(s) already exist.
           </p>
         </div>
       ) : (
         <div className="analysis-success">
-          No obvious matching active report found
-          by the demo checker.
+          No obvious matching active report found by the demo checker.
         </div>
       )}
     </div>
   );
 }
 
-function AnalysisItem({
-  title,
-  value,
-  className = "",
-}) {
+function AnalysisItem({ title, value, className = "" }) {
   return (
     <div className="analysis-item">
       <span>{title}</span>
-
-      <strong className={className}>
-        {value}
-      </strong>
+      <strong className={className}>{value}</strong>
     </div>
   );
 }
 
-function ComplaintCard({
-  complaint,
-  onOpen,
-}) {
+function ComplaintCard({ complaint, onOpen }) {
   return (
-    <button
-      type="button"
-      className="complaint-card"
-      onClick={onOpen}
-    >
+    <button type="button" className="complaint-card" onClick={onOpen}>
       <div className="complaint-card-top">
         <div>
           <span className="complaint-id">
-            {complaint.id}
+            {complaint.displayId || complaint.id}
           </span>
-
           <h3>{complaint.category}</h3>
           <p>{complaint.description}</p>
         </div>
-
         <div className="complaint-score">
           <span>Priority</span>
           <strong>{complaint.priority}</strong>
@@ -1328,27 +1159,18 @@ function ComplaintCard({
       </div>
 
       <div className="complaint-tags">
-        <span
-          className={`severity-tag ${complaint.severity.toLowerCase()}`}
-        >
+        <span className={`severity-tag ${complaint.severity.toLowerCase()}`}>
           {complaint.severity}
         </span>
-
         <span>{complaint.department}</span>
         <span>Target: {complaint.sla}</span>
       </div>
 
-      <ComplaintTimeline
-        status={complaint.status}
-      />
+      <ComplaintTimeline status={complaint.status} />
 
       <div className="complaint-card-footer">
         <span>⌖ {complaint.location}</span>
-
-        <span>
-          {complaint.reports} citizen report(s)
-        </span>
-
+        <span>{complaint.reports} citizen report(s)</span>
         <strong>View details →</strong>
       </div>
     </button>
@@ -1377,16 +1199,11 @@ function ComplaintTimeline({ status }) {
   const current = progress[status] || 1;
 
   return (
-    <div
-      className="timeline"
-      aria-label={`Complaint status: ${status}`}
-    >
+    <div className="timeline" aria-label={`Complaint status: ${status}`}>
       {steps.map((step, index) => (
         <div
           key={step}
-          className={`timeline-step ${
-            index < current ? "done" : ""
-          }`}
+          className={`timeline-step ${index < current ? "done" : ""}`}
         >
           <span />
           <small>{step}</small>
@@ -1398,35 +1215,43 @@ function ComplaintTimeline({ status }) {
 
 function ComplaintModal({
   complaint,
+  isAuthority,
+  currentUserId,
+  authorityStatus,
+  authorityNote,
+  verifyNote,
+  onAuthorityStatus,
+  onAuthorityNote,
+  onVerifyNote,
+  onProcess,
+  onReview,
   onClose,
   onSameIssue,
   afterImageRef,
   onAfterImage,
 }) {
+  const canConfirm =
+    !complaint.confirmedByMe &&
+    complaint.createdBy !== currentUserId &&
+    !["Resolved", "Verified"].includes(complaint.status);
+
   return (
-    <div
-      className="modal-backdrop"
-      onClick={onClose}
-    >
+    <div className="modal-backdrop" onClick={onClose}>
       <div
         className="complaint-modal"
         role="dialog"
         aria-modal="true"
-        aria-label={`Complaint ${complaint.id}`}
-        onClick={(event) =>
-          event.stopPropagation()
-        }
+        aria-label={`Complaint ${complaint.displayId || complaint.id}`}
+        onClick={(event) => event.stopPropagation()}
       >
         <div className="modal-header">
           <div>
             <span className="analysis-kicker">
-              {complaint.id}
+              {complaint.displayId || complaint.id}
             </span>
-
             <h2>{complaint.category}</h2>
-            <p>{complaint.description}</p>
+            <p>{complaint.description || fallbackDescription(complaint.category, complaint.location)}</p>
           </div>
-
           <button
             type="button"
             className="close-button"
@@ -1438,107 +1263,79 @@ function ComplaintModal({
         </div>
 
         <div className="analysis-grid modal-grid">
-          <AnalysisItem
-            title="Severity"
-            value={complaint.severity}
-          />
-
-          <AnalysisItem
-            title="Priority"
-            value={`${complaint.priority}/100`}
-          />
-
+          <AnalysisItem title="Severity" value={complaint.severity} />
+          <AnalysisItem title="Priority" value={`${complaint.priority}/100`} />
           <AnalysisItem
             title="Suggested department"
             value={complaint.department}
           />
-
-          <AnalysisItem
-            title="Illustrative target"
-            value={complaint.sla}
-          />
+          <AnalysisItem title="Illustrative target" value={complaint.sla} />
         </div>
 
         <div className="modal-section">
           <h3>Complaint lifecycle</h3>
-
-          <ComplaintTimeline
-            status={complaint.status}
-          />
+          <ComplaintTimeline status={complaint.status} />
         </div>
 
-        <div className="community-card">
-          <div>
-            <strong>
-              Is this issue also affecting you?
-            </strong>
-
-            <p>
-              {complaint.reports} citizen(s)
-              have confirmed this issue.
-            </p>
+        {canConfirm && (
+          <div className="community-card">
+            <div>
+              <strong>Is this issue also affecting you?</strong>
+              <p>
+                {complaint.reports} citizen(s) have confirmed this issue.
+              </p>
+            </div>
+            <button type="button" onClick={onSameIssue}>
+              + Same issue
+            </button>
           </div>
+        )}
 
-          <button
-            type="button"
-            onClick={onSameIssue}
-          >
-            + Same issue
-          </button>
-        </div>
-
-        {complaint.status === "Resolved" && (
+        {(complaint.beforeImage ||
+          complaint.afterImage ||
+          complaint.status === "Resolved" ||
+          isAuthority) && (
           <div className="verification-card">
-            <span className="analysis-kicker">
-              RESOLUTION VERIFICATION
-            </span>
-
-            <h3>Review the repair</h3>
-
+            <span className="analysis-kicker">BEFORE / AFTER</span>
+            <h3>Resolution comparison</h3>
             <p>
-              Compare before and after photos.
-              Adding an after photo does not
-              automatically verify the repair.
+              Original and repair photos are stored in your CivicCare
+              account so they remain available after refresh.
             </p>
-
             <div className="verification-images">
               <div>
                 <span>Before</span>
-
                 {complaint.beforeImage ? (
-                  <img
-                    src={complaint.beforeImage}
-                    alt="Before repair"
-                  />
+                  complaint.beforeIsVideo ? (
+                    <video src={complaint.beforeImage} controls playsInline className="preview-image" />
+                  ) : (
+                    <img src={complaint.beforeImage} alt="Before repair" />
+                  )
                 ) : (
                   <div className="image-placeholder">
                     No saved original photo
                   </div>
                 )}
               </div>
-
               <div>
                 <span>After</span>
-
                 {complaint.afterImage ? (
-                  <img
-                    src={complaint.afterImage}
-                    alt="After repair"
-                  />
-                ) : (
+                  <img src={complaint.afterImage} alt="After repair" />
+                ) : isAuthority ? (
                   <button
                     type="button"
                     className="after-upload"
-                    onClick={() =>
-                      afterImageRef.current?.click()
-                    }
+                    onClick={() => afterImageRef.current?.click()}
                   >
                     + Add after photo
                   </button>
+                ) : (
+                  <div className="image-placeholder">
+                    Waiting for a resolution photo
+                  </div>
                 )}
               </div>
             </div>
-
             <input
               ref={afterImageRef}
               type="file"
@@ -1547,24 +1344,78 @@ function ComplaintModal({
               onChange={onAfterImage}
               aria-label="Upload after photo"
             />
-
-            {complaint.afterImage && (
-              <div className="analysis-success">
-                Before/after review is available
-                for this session.
-              </div>
-            )}
           </div>
         )}
 
+        {isAuthority && (
+          <div className="authority-panel">
+            <h3>Process this complaint</h3>
+            <label htmlFor="authority-status">Status</label>
+            <select
+              id="authority-status"
+              value={authorityStatus}
+              onChange={(event) => onAuthorityStatus(event.target.value)}
+            >
+              {authorityStatusOptions.map((status) => (
+                <option key={status} value={status}>
+                  {status}
+                </option>
+              ))}
+            </select>
+            <label htmlFor="authority-note">Internal note (optional)</label>
+            <textarea
+              id="authority-note"
+              rows={3}
+              value={authorityNote}
+              onChange={(event) => onAuthorityNote(event.target.value)}
+            />
+            <button
+              type="button"
+              className="submit-button"
+              onClick={onProcess}
+            >
+              Save status
+            </button>
+          </div>
+        )}
+
+        {complaint.status === "Resolved" &&
+          (complaint.createdBy === currentUserId ||
+            complaint.confirmedByMe) && (
+            <div className="authority-panel">
+              <h3>Verify the repair</h3>
+              <p>
+                Compare the photos, then confirm whether the work looks
+                complete. This does not use image recognition.
+              </p>
+              <textarea
+                rows={3}
+                value={verifyNote}
+                placeholder="Optional comment"
+                onChange={(event) => onVerifyNote(event.target.value)}
+              />
+              <div className="verify-actions">
+                <button
+                  type="button"
+                  className="submit-button"
+                  onClick={() => onReview(true)}
+                >
+                  Looks repaired
+                </button>
+                <button
+                  type="button"
+                  className="gps-button"
+                  onClick={() => onReview(false)}
+                >
+                  Still needs work
+                </button>
+              </div>
+            </div>
+          )}
+
         <div className="modal-footer">
           <span>{complaint.location}</span>
-
-          <button
-            type="button"
-            className="modal-close"
-            onClick={onClose}
-          >
+          <button type="button" className="modal-close" onClick={onClose}>
             Done
           </button>
         </div>

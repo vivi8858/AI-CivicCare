@@ -1,0 +1,83 @@
+
+cd ~/AI-CivicCare
+
+python3 - <<'PY'
+from pathlib import Path
+
+path = Path("frontend/src/App.jsx")
+code = path.read_text()
+
+# Create backup
+backup = path.with_suffix(".jsx.backup")
+backup.write_text(code)
+
+# 1. Make description optional
+old = '''<label htmlFor="description">
+                      Tell us what you noticed
+                    </label>'''
+
+new = '''<label htmlFor="description">
+                      Tell us what you noticed (optional)
+                    </label>'''
+
+if old not in code:
+    raise SystemExit("Description label not found. No changes saved.")
+
+code = code.replace(old, new, 1)
+
+# 2. Remove required validation from description
+old = '''id="description"
+                    rows={5}
+                    required
+                    value={description}'''
+
+new = '''id="description"
+                    rows={5}
+                    value={description}'''
+
+if old not in code:
+    raise SystemExit("Description field not found. No changes saved.")
+
+code = code.replace(old, new, 1)
+
+# 3. Allow analysis without a description
+old = '''!category ||
+      !description.trim() ||
+      !location.trim()'''
+
+new = '''!category ||
+      !location.trim()'''
+
+if old not in code:
+    raise SystemExit("Validation block not found. No changes saved.")
+
+code = code.replace(old, new, 1)
+
+code = code.replace(
+    "Please enter the issue type, description and location.",
+    "Please select an issue type and provide a location.",
+    1
+)
+
+# 4. Automatically generate description if empty
+old = '''description: description.trim(),'''
+
+new = '''description:
+        description.trim() ||
+        `${category} issue reported at ${location.trim()}.`,'''
+
+if old not in code:
+    raise SystemExit("Complaint creation code not found. No changes saved.")
+
+code = code.replace(old, new, 1)
+
+path.write_text(code)
+
+print("SUCCESS: App.jsx updated!")
+print("Backup created: frontend/src/App.jsx.backup")
+print("Description is now optional.")
+print("Original frontend theme preserved.")
+PY
+
+cd frontend
+npm run build
